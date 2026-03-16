@@ -1,24 +1,799 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
+import aiohttp
+import asyncio
+import re
+from datetime import datetime, timezone, timedelta
+from urllib.parse import quote
+from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.star import Context, Star
 from astrbot.api import logger
 
-@register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
-class MyPlugin(Star):
+# 东八区时区
+CST = timezone(timedelta(hours=8))
+
+
+class CTBUElectPlugin(Star):
+    '''CTBU 电费查询与自动推送插件'''
+
     def __init__(self, context: Context):
         super().__init__(context)
+        # 校区前缀映射
+        self.CAMPUS_PREFIX = {
+            "cy": ("茶园校区", "茶园{building}栋"),      # 茶园10-19栋
+            "lhh": ("兰花湖校区", "兰花湖{building}舍"),  # 兰花湖1-16舍
+            "bq": ("南岸校区", "北区{building}舍"),       # 北区1-24舍
+            "nq": ("南岸校区", "南区{building}舍"),       # 南区1-3,5-12,13A,13B,13C,14,15,16A,16B舍
+            "yjs": ("南岸校区", "研究生公寓"),            # 研究生公寓
+        }
+        # 电费查询 URL 基础地址
+        self.base_url = "https://hqpay.ctbu.edu.cn/weixin/ashx/frmuser.ashx"
+        # 缴费入口 URL
+        self.pay_url = "https://hqpay.ctbu.edu.cn/weixin/index.html"
+        # 存储订阅用户: {unified_msg_origin: {"room_id": str, "threshold": float, "push_enabled": bool, "push_time": int, "low_balance_push_enabled": bool}}
+        self.subscribers: dict[str, dict] = {}
+        # 定时任务
+        self._task = None
+        # 默认低电量提醒阈值（元）
+        self.default_threshold = 10.0
+        # 默认推送时间（小时，东八区）
+        self.default_push_time = 10
+        # 订阅轮询间隔（分钟），0 = 对齐整点（默认）
+        self.poll_interval = 0
 
     async def initialize(self):
-        """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
-
-    # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
-    @filter.command("helloworld")
-    async def helloworld(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令""" # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
-        user_name = event.get_sender_name()
-        message_str = event.message_str # 用户发的纯文本消息字符串
-        message_chain = event.get_messages() # 用户所发的消息的消息链 # from astrbot.api.message_components import *
-        logger.info(message_chain)
-        yield event.plain_result(f"Hello, {user_name}, 你发了 {message_str}!") # 发送一条纯文本消息
+        """插件初始化，加载订阅数据并启动定时推送任务"""
+        logger.info("CTBU 电费插件初始化中...")
+        # 从 KV 存储加载订阅数据
+        self.subscribers = await self.get_kv_data("subscribers", {})
+        logger.info(f"已加载 {len(self.subscribers)} 个订阅")
+        # 从 KV 存储加载轮询间隔
+        self.poll_interval = await self.get_kv_data("poll_interval", 0)
+        interval_desc = f"{self.poll_interval} 分钟" if self.poll_interval > 0 else "每小时整点"
+        logger.info(f"轮询间隔: {interval_desc} (时区: UTC+8)")
+        # 启动定时推送任务
+        self._task = asyncio.create_task(self._auto_push_task())
+        logger.info("CTBU 电费插件初始化完成")
 
     async def terminate(self):
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+        """插件卸载时取消定时任务"""
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        logger.info("CTBU 电费插件已卸载")
+
+    def _parse_room_id(self, room_id: str) -> tuple[str, str, str, str] | None:
+        """
+        解析房间号，返回 (校区, 楼栋名称, pid, 原始房间号)
+
+        支持的格式：
+        - cy10-101: 茶园校区 茶园10栋 101室 -> pid=10-101
+        - lhh1-101: 兰花湖校区 兰花湖1舍 101室 -> pid=101
+        - bq1-101: 南岸校区 北区1舍 A1001室 -> pid=A1001
+        - nq1-101: 南岸校区 南区1舍 101室 -> pid=101
+        - yjs-101: 南岸校区 研究生公寓 1101室 -> pid=1101
+        """
+        room_id = room_id.strip()
+
+        # 匹配格式: 前缀 + 楼栋号 + - + 房间号（房间号允许字母、中文等，如 A1001、102值班室）
+        match = re.match(r'^([a-zA-Z]+)(\d+[a-zA-Z]?)?-(\w+)$', room_id, re.IGNORECASE | re.UNICODE)
+        if not match:
+            return None
+
+        prefix = match.group(1).lower()
+        building_num = match.group(2) or ""
+        room_num = match.group(3)
+
+        if prefix not in self.CAMPUS_PREFIX:
+            return None
+
+        campus, building_template = self.CAMPUS_PREFIX[prefix]
+
+        # 构建楼栋名称和 pid
+        if prefix == "cy":
+            # 茶园校区: pid 包含楼栋号
+            building_name = building_template.format(building=building_num)
+            pid = f"{building_num}-{room_num}"
+        elif prefix == "yjs":
+            # 研究生公寓: 没有楼栋号
+            building_name = "研究生公寓"
+            pid = room_num
+        else:
+            # 其他校区: pid 只有房间号
+            building_name = building_template.format(building=building_num.upper())
+            pid = room_num
+
+        return (campus, building_name, pid, room_id)
+
+    def _build_url(self, room_id: str) -> str | None:
+        """根据房间号构建查询 URL"""
+        parsed = self._parse_room_id(room_id)
+        if not parsed:
+            return None
+
+        campus, building_name, pid, _ = parsed
+        encoded_building = quote(building_name)
+        return f"{self.base_url}?test=lastlist&pid={pid}&dyid={encoded_building}"
+
+    async def _fetch_elect_data(self, room_id: str) -> dict | None:
+        """
+        访问电费查询接口获取数据
+        :param room_id: 房间号，格式如 cy10-101
+        :return: 解析后的字典
+        """
+        url = self._build_url(room_id)
+        if not url:
+            return None
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        try:
+            connector = aiohttp.TCPConnector(ssl=False)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    if response.status == 200:
+                        data = await response.json(content_type=None)
+                        if data and len(data) > 0 and len(data[0]) >= 4:
+                            room_info = data[0]
+                            return {
+                                "room_id": room_id,
+                                "pid": room_info[0],
+                                "remaining": float(room_info[1]),
+                                "update_time": room_info[2],
+                                "total_used": room_info[3]
+                            }
+                        else:
+                            logger.warning(f"电费数据格式异常: {data}")
+                            return None
+                    else:
+                        logger.error(f"电费接口返回状态码: {response.status}")
+                        return None
+        except asyncio.TimeoutError:
+            logger.error("电费接口请求超时")
+            return None
+        except Exception as e:
+            logger.error(f"获取电费数据失败: {e}")
+            return None
+
+    def _format_elect_message(self, data: dict, threshold: float = None) -> str:
+        """
+        格式化电费信息
+        :param data: 电费数据
+        :param threshold: 低余额阈值，低于此值时显示缴费入口
+        """
+        if threshold is None:
+            threshold = self.default_threshold
+
+        room_id = data["room_id"]
+        parsed = self._parse_room_id(room_id)
+        if not parsed:
+            return "数据解析失败"
+
+        campus, building_name, pid, _ = parsed
+        remaining = data["remaining"]
+
+        # 基本信息
+        message = (
+            f"电费查询结果\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"位置: {campus} {building_name} {pid}室\n"
+            f"余额: {remaining} 元\n"
+            f"累耗: {data['total_used']} 元\n"
+            f"结算: {data['update_time']}"
+        )
+
+        # 低余额提醒和缴费入口
+        if remaining < threshold:
+            message += (
+                f"\n\n[!] 余额不足 {threshold} 元，请尽快充值！\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"缴费入口:\n{self.pay_url}"
+            )
+
+        return message
+
+    def _get_help_message(self) -> str:
+        """获取帮助信息"""
+        return (
+            "CTBU 电费查询插件帮助\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "房间号格式\n"
+            "格式: 校区前缀 + 楼栋号 + - + 房间号\n"
+            "例如: cy10-101、lhh1-203、bq5-305\n\n"
+            "校区前缀:\n"
+            "  cy  - 茶园校区 (10-19栋)\n"
+            "  lhh - 兰花湖校区 (1-16舍)\n"
+            "  bq  - 南岸北区 (1-24舍)\n"
+            "  nq  - 南岸南区 (1-16舍)\n"
+            "  yjs - 研究生公寓\n\n"
+            "常用命令\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "查询电费:\n"
+            "  /电费 cy10-101    查询指定房间\n"
+            "  /电费            查询已绑定房间\n\n"
+            "绑定房间:\n"
+            "  /订阅电费 cy10-101      绑定并设置默认阈值\n"
+            "  /订阅电费 cy10-101 15   绑定并设置自定义阈值\n"
+            "  /取消订阅电费           取消绑定\n\n"
+            "定时推送:\n"
+            "  /开启推送             开启定时推送\n"
+            "  /关闭推送             关闭定时推送\n"
+            "  /设置推送时间 10       设置推送时间(默认10点)\n\n"
+            "低余额推送:\n"
+            "  /开启低余额推送        余额不足自动提醒\n"
+            "  /关闭低余额推送        关闭低余额提醒\n\n"
+            "其他设置:\n"
+            "  /设置阈值 15           设置低余额阈值\n"
+            "  /设置轮询间隔 0        设置轮询间隔(0=整点)\n"
+            "  /我的订阅              查看当前配置\n"
+            "  /缴费                 快速获取缴费入口\n\n"
+            "使用建议\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "1. 首次使用: /订阅电费 <房间号>\n"
+            "2. 开启定时推送: /开启推送\n"
+            "3. 开启低余额推送: /开启低余额推送\n"
+            "4. 设置推送时间: /设置推送时间 <小时>\n"
+            "5. 两种推送可独立开关，互不影响\n"
+            "6. 所有时间均为东八区 (UTC+8)"
+        )
+
+    async def _get_user_threshold(self, umo: str) -> float:
+        """获取用户设置的阈值"""
+        if umo in self.subscribers:
+            return self.subscribers[umo].get("threshold", self.default_threshold)
+        return self.default_threshold
+
+    @filter.command("电费", alias={"df", "查电费", "elect"})
+    async def query_elect(self, event: AstrMessageEvent, room_id: str = ""):
+        """查询电费余额"""
+        umo = event.unified_msg_origin
+
+        # 如果未指定房间号，尝试使用绑定的房间
+        if not room_id:
+            if umo in self.subscribers:
+                room_id = self.subscribers[umo]["room_id"]
+            else:
+                # 未绑定房间，提示用户
+                yield event.plain_result(
+                    "[提示] 您还未绑定房间\n\n"
+                    "请使用以下方式查询:\n"
+                    "1. 直接查询: /电费 <房间号>\n"
+                    "   示例: /电费 cy10-101\n\n"
+                    "2. 订阅后查询: /订阅电费 <房间号>\n"
+                    "   订阅后可直接使用 /电费 查询\n\n"
+                    "输入 /电费帮助 查看更多信息"
+                )
+                return
+
+        # 验证房间号格式
+        if not self._parse_room_id(room_id):
+            yield event.plain_result(
+                "[错误] 房间号格式错误\n\n" + self._get_help_message()
+            )
+            return
+
+        yield event.plain_result(f"正在查询 {room_id} ...")
+
+        data = await self._fetch_elect_data(room_id)
+        if data:
+            threshold = await self._get_user_threshold(umo)
+            message = self._format_elect_message(data, threshold)
+            yield event.plain_result(message)
+        else:
+            yield event.plain_result(
+                f"[错误] 查询失败\n"
+                f"房间: {room_id}\n"
+                f"原因: 房间号不存在或网络异常"
+            )
+
+    @filter.command("电费帮助", alias={"dfhelp", "elect_help"})
+    async def elect_help(self, event: AstrMessageEvent):
+        """显示电费查询帮助"""
+        yield event.plain_result(self._get_help_message())
+
+    @filter.command("订阅电费", alias={"订阅", "subscribe_elect"})
+    async def subscribe_elect(self, event: AstrMessageEvent, room_id: str = "", threshold: str = ""):
+        """
+        订阅电费自动推送
+        :param room_id: 房间号
+        :param threshold: 低余额阈值（可选）
+        """
+        if not room_id:
+            umo = event.unified_msg_origin
+            if umo in self.subscribers:
+                # 已订阅用户可以不传房间号（保持原有绑定）
+                room_id = self.subscribers[umo]["room_id"]
+            else:
+                # 新用户必须提供房间号
+                yield event.plain_result(
+                    "[错误] 首次订阅需要指定房间号\n\n"
+                    "使用方法:\n"
+                    "/订阅电费 <房间号> [阈值]\n\n"
+                    "示例:\n"
+                    "/订阅电费 cy10-101\n"
+                    "/订阅电费 cy10-101 15\n\n"
+                    "输入 /电费帮助 查看房间号格式"
+                )
+                return
+
+        if not self._parse_room_id(room_id):
+            yield event.plain_result(
+                "[错误] 房间号格式错误\n\n" + self._get_help_message()
+            )
+            return
+
+        # 解析阈值
+        threshold_value = self.default_threshold
+        if threshold:
+            try:
+                threshold_value = float(threshold)
+                if threshold_value <= 0:
+                    yield event.plain_result("[错误] 阈值必须大于 0")
+                    return
+            except ValueError:
+                yield event.plain_result("[错误] 阈值必须是有效的数字")
+                return
+
+        umo = event.unified_msg_origin
+        existing = self.subscribers.get(umo)
+        if existing:
+            # 已订阅用户：只更新房间号和阈值，保留推送设置
+            existing["room_id"] = room_id
+            existing["threshold"] = threshold_value
+        else:
+            self.subscribers[umo] = {
+                "room_id": room_id,
+                "threshold": threshold_value,
+                "push_enabled": False,
+                "push_time": self.default_push_time,
+                "low_balance_push_enabled": False
+            }
+
+        # 保存到 KV 存储
+        await self.put_kv_data("subscribers", self.subscribers)
+
+        user_data = self.subscribers[umo]
+        push_enabled = user_data.get("push_enabled", False)
+        push_time = user_data.get("push_time", self.default_push_time)
+        push_status = f"已开启 (每天 {push_time}:00)" if push_enabled else "已关闭"
+        low_balance_status = "已开启" if user_data.get("low_balance_push_enabled", False) else "已关闭"
+
+        yield event.plain_result(
+            f"绑定成功\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"房间: {room_id}\n"
+            f"阈值: {threshold_value} 元\n"
+            f"定时推送: {push_status}\n"
+            f"低余额推送: {low_balance_status}\n\n"
+            f"提示:\n"
+            f"{'关闭定时推送: /关闭推送' if push_enabled else '开启定时推送: /开启推送'}\n"
+            f"{'关闭低余额推送: /关闭低余额推送' if user_data.get('low_balance_push_enabled', False) else '开启低余额推送: /开启低余额推送'}\n"
+            f"设置推送时间: /设置推送时间 <小时>\n"
+            f"修改阈值: /设置阈值 <金额>\n"
+            f"取消绑定: /取消订阅电费"
+        )
+
+    @filter.command("取消订阅电费", alias={"取消订阅", "unsubscribe_elect"})
+    async def unsubscribe_elect(self, event: AstrMessageEvent):
+        """取消订阅电费推送"""
+        umo = event.unified_msg_origin
+        if umo in self.subscribers:
+            user_data = self.subscribers.pop(umo)
+            await self.put_kv_data("subscribers", self.subscribers)
+            yield event.plain_result(f"已取消 {user_data['room_id']} 的订阅")
+        else:
+            yield event.plain_result("[错误] 您还没有订阅电费推送")
+
+    @filter.command("设置阈值", alias={"阈值", "set_threshold"})
+    async def set_threshold(self, event: AstrMessageEvent, threshold: str = ""):
+        """
+        设置低余额提醒阈值
+        :param threshold: 阈值金额（元）
+        """
+        umo = event.unified_msg_origin
+
+        if not threshold:
+            # 显示当前阈值
+            current = await self._get_user_threshold(umo)
+            yield event.plain_result(
+                f"当前低余额阈值: {current} 元\n\n"
+                f"使用方法: /设置阈值 <金额>\n"
+                f"示例: /设置阈值 15"
+            )
+            return
+
+        try:
+            threshold_value = float(threshold)
+            if threshold_value <= 0:
+                yield event.plain_result("[错误] 阈值必须大于 0")
+                return
+        except ValueError:
+            yield event.plain_result("[错误] 请输入有效的数字")
+            return
+
+        # 如果用户已订阅，更新阈值；否则需要先订阅
+        if umo in self.subscribers:
+            self.subscribers[umo]["threshold"] = threshold_value
+            await self.put_kv_data("subscribers", self.subscribers)
+            yield event.plain_result(
+                f"阈值已更新\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"房间: {self.subscribers[umo]['room_id']}\n"
+                f"新阈值: {threshold_value} 元\n"
+                f"余额低于此值时将自动显示缴费入口"
+            )
+        else:
+            yield event.plain_result(
+                f"[提示] 您还未订阅电费推送\n\n"
+                f"请先使用以下命令订阅:\n"
+                f"/订阅电费 <房间号> {threshold_value}\n\n"
+                f"示例: /订阅电费 cy10-101 {threshold_value}"
+            )
+
+    @filter.command("开启推送", alias={"启用推送", "enable_push"})
+    async def enable_push(self, event: AstrMessageEvent):
+        """开启电费自动推送"""
+        umo = event.unified_msg_origin
+        if umo not in self.subscribers:
+            yield event.plain_result(
+                "[提示] 您还未绑定房间\n\n"
+                "请先使用 /订阅电费 <房间号> 绑定房间"
+            )
+            return
+
+        if self.subscribers[umo].get("push_enabled", False):
+            push_time = self.subscribers[umo].get("push_time", self.default_push_time)
+            yield event.plain_result(
+                f"[提示] 推送已经是开启状态\n\n"
+                f"当前推送时间: 每天 {push_time}:00\n"
+                f"修改时间: /设置推送时间 <小时>"
+            )
+            return
+
+        self.subscribers[umo]["push_enabled"] = True
+        await self.put_kv_data("subscribers", self.subscribers)
+
+        push_time = self.subscribers[umo].get("push_time", self.default_push_time)
+        yield event.plain_result(
+            f"推送已开启\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"房间: {self.subscribers[umo]['room_id']}\n"
+            f"推送时间: 每天 {push_time}:00\n\n"
+            f"修改推送时间: /设置推送时间 <小时>\n"
+            f"关闭推送: /关闭推送"
+        )
+
+    @filter.command("关闭推送", alias={"禁用推送", "disable_push"})
+    async def disable_push(self, event: AstrMessageEvent):
+        """关闭电费自动推送"""
+        umo = event.unified_msg_origin
+        if umo not in self.subscribers:
+            yield event.plain_result(
+                "[提示] 您还未绑定房间\n\n"
+                "请先使用 /订阅电费 <房间号> 绑定房间"
+            )
+            return
+
+        if not self.subscribers[umo].get("push_enabled", False):
+            yield event.plain_result("[提示] 推送已经是关闭状态")
+            return
+
+        self.subscribers[umo]["push_enabled"] = False
+        await self.put_kv_data("subscribers", self.subscribers)
+
+        yield event.plain_result(
+            f"推送已关闭\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"房间绑定仍然保留，您仍可使用 /电费 查询\n\n"
+            f"重新开启: /开启推送"
+        )
+
+    @filter.command("开启低余额推送", alias={"启用低余额推送", "enable_low_balance_push"})
+    async def enable_low_balance_push(self, event: AstrMessageEvent):
+        """开启低余额自动推送"""
+        umo = event.unified_msg_origin
+        if umo not in self.subscribers:
+            yield event.plain_result(
+                "[提示] 您还未绑定房间\n\n"
+                "请先使用 /订阅电费 <房间号> 绑定房间"
+            )
+            return
+
+        if self.subscribers[umo].get("low_balance_push_enabled", False):
+            threshold = self.subscribers[umo].get("threshold", self.default_threshold)
+            yield event.plain_result(
+                f"[提示] 低余额推送已经是开启状态\n\n"
+                f"当前阈值: {threshold} 元\n"
+                f"余额低于阈值时会自动推送提醒\n"
+                f"修改阈值: /设置阈值 <金额>"
+            )
+            return
+
+        self.subscribers[umo]["low_balance_push_enabled"] = True
+        await self.put_kv_data("subscribers", self.subscribers)
+
+        threshold = self.subscribers[umo].get("threshold", self.default_threshold)
+        yield event.plain_result(
+            f"低余额推送已开启\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"房间: {self.subscribers[umo]['room_id']}\n"
+            f"阈值: {threshold} 元\n"
+            f"提醒: 余额低于阈值时自动推送\n\n"
+            f"说明: 每小时检查一次，低于阈值立即提醒\n"
+            f"修改阈值: /设置阈值 <金额>\n"
+            f"关闭推送: /关闭低余额推送"
+        )
+
+    @filter.command("关闭低余额推送", alias={"禁用低余额推送", "disable_low_balance_push"})
+    async def disable_low_balance_push(self, event: AstrMessageEvent):
+        """关闭低余额自动推送"""
+        umo = event.unified_msg_origin
+        if umo not in self.subscribers:
+            yield event.plain_result(
+                "[提示] 您还未绑定房间\n\n"
+                "请先使用 /订阅电费 <房间号> 绑定房间"
+            )
+            return
+
+        if not self.subscribers[umo].get("low_balance_push_enabled", False):
+            yield event.plain_result("[提示] 低余额推送已经是关闭状态")
+            return
+
+        self.subscribers[umo]["low_balance_push_enabled"] = False
+        await self.put_kv_data("subscribers", self.subscribers)
+
+        yield event.plain_result(
+            f"低余额推送已关闭\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"不再自动推送低余额提醒\n"
+            f"仍可通过 /电费 命令手动查询\n\n"
+            f"重新开启: /开启低余额推送"
+        )
+
+    @filter.command("设置推送时间", alias={"推送时间", "set_push_time"})
+    async def set_push_time(self, event: AstrMessageEvent, hour: str = ""):
+        """
+        设置每日推送时间
+        :param hour: 小时 (0-23)
+        """
+        umo = event.unified_msg_origin
+
+        if umo not in self.subscribers:
+            yield event.plain_result(
+                "[提示] 您还未绑定房间\n\n"
+                "请先使用 /订阅电费 <房间号> 绑定房间"
+            )
+            return
+
+        if not hour:
+            # 显示当前推送时间
+            current_time = self.subscribers[umo].get("push_time", self.default_push_time)
+            push_enabled = self.subscribers[umo].get("push_enabled", False)
+            status = "已开启" if push_enabled else "已关闭"
+            yield event.plain_result(
+                f"推送设置\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"推送时间: 每天 {current_time}:00\n"
+                f"推送状态: {status}\n\n"
+                f"修改时间: /设置推送时间 <小时>\n"
+                f"示例: /设置推送时间 8"
+            )
+            return
+
+        try:
+            hour_value = int(hour)
+            if hour_value < 0 or hour_value > 23:
+                yield event.plain_result("[错误] 小时必须在 0-23 之间")
+                return
+        except ValueError:
+            yield event.plain_result("[错误] 请输入有效的小时数 (0-23)")
+            return
+
+        self.subscribers[umo]["push_time"] = hour_value
+        await self.put_kv_data("subscribers", self.subscribers)
+
+        push_enabled = self.subscribers[umo].get("push_enabled", False)
+        status_text = f"推送状态: 已开启\n推送将在每天 {hour_value}:00 进行" if push_enabled else f"推送状态: 已关闭\n开启后将在每天 {hour_value}:00 推送"
+
+        yield event.plain_result(
+            f"推送时间已更新\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"新时间: 每天 {hour_value}:00\n"
+            f"{status_text}\n\n"
+            f"{'关闭推送: /关闭推送' if push_enabled else '开启推送: /开启推送'}"
+        )
+
+    @filter.command("设置轮询间隔", alias={"轮询间隔", "set_poll_interval"})
+    async def set_poll_interval(self, event: AstrMessageEvent, minutes: str = ""):
+        """
+        设置后台订阅轮询间隔（管理员功能）
+        :param minutes: 轮询间隔分钟数，0 = 每小时整点
+        """
+        if not minutes:
+            interval_desc = f"{self.poll_interval} 分钟" if self.poll_interval > 0 else "每小时整点（默认）"
+            yield event.plain_result(
+                f"轮询间隔设置\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"当前间隔: {interval_desc}\n"
+                f"时区: UTC+8 (东八区)\n\n"
+                f"修改方法: /设置轮询间隔 <分钟数>\n"
+                f"示例:\n"
+                f"  /设置轮询间隔 0    每小时整点检查（默认）\n"
+                f"  /设置轮询间隔 30   每30分钟检查一次\n"
+                f"  /设置轮询间隔 60   每60分钟检查一次"
+            )
+            return
+
+        try:
+            minutes_value = int(minutes)
+            if minutes_value < 0:
+                yield event.plain_result("[错误] 间隔分钟数不能为负数")
+                return
+            if minutes_value > 0 and minutes_value < 5:
+                yield event.plain_result("[错误] 最小轮询间隔为 5 分钟")
+                return
+        except ValueError:
+            yield event.plain_result("[错误] 请输入有效的整数（分钟数）")
+            return
+
+        self.poll_interval = minutes_value
+        await self.put_kv_data("poll_interval", self.poll_interval)
+
+        interval_desc = f"{minutes_value} 分钟" if minutes_value > 0 else "每小时整点"
+        yield event.plain_result(
+            f"轮询间隔已更新\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"新间隔: {interval_desc}\n"
+            f"时区: UTC+8 (东八区)\n\n"
+            f"说明: 重启任务后生效，当前任务将在下次唤醒时采用新间隔"
+        )
+
+    @filter.command("缴费", alias={"电费充值", "充值电费", "pay_elect"})
+    async def pay_elect(self, event: AstrMessageEvent):
+        """获取电费缴费链接"""
+        yield event.plain_result(
+            "电费缴费入口\n"
+            "━━━━━━━━━━━━━━\n"
+            "请点击以下链接进行缴费:\n"
+            f"{self.pay_url}\n\n"
+            "提示: 建议先通过 /电费 命令查询余额后再充值"
+        )
+
+    @filter.command("我的订阅", alias={"查看订阅", "subscription"})
+    async def view_subscription(self, event: AstrMessageEvent):
+        """查看当前订阅信息"""
+        umo = event.unified_msg_origin
+        if umo in self.subscribers:
+            user_data = self.subscribers[umo]
+            push_enabled = user_data.get("push_enabled", False)
+            push_time = user_data.get("push_time", self.default_push_time)
+            push_status = f"已开启 (每天 {push_time}:00)" if push_enabled else "已关闭"
+
+            low_balance_push_enabled = user_data.get("low_balance_push_enabled", False)
+            low_balance_status = "已开启" if low_balance_push_enabled else "已关闭"
+
+            yield event.plain_result(
+                f"订阅信息\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"房间: {user_data['room_id']}\n"
+                f"阈值: {user_data['threshold']} 元\n"
+                f"定时推送: {push_status}\n"
+                f"低余额推送: {low_balance_status}\n"
+                f"绑定状态: 已绑定\n\n"
+                f"快速操作:\n"
+                f"{'关闭定时推送: /关闭推送\n' if push_enabled else '开启定时推送: /开启推送\n'}"
+                f"{'关闭低余额推送: /关闭低余额推送' if low_balance_push_enabled else '开启低余额推送: /开启低余额推送'}"
+            )
+        else:
+            yield event.plain_result(
+                "[提示] 您还未绑定房间\n\n"
+                "使用 /订阅电费 <房间号> 绑定房间"
+            )
+
+    async def _auto_push_task(self):
+        """定时推送任务（时区: UTC+8）"""
+        from astrbot.api.event import MessageChain
+
+        # 记录已推送定时消息的用户（避免一天内重复推送）：{umo: date}
+        pushed_users: dict[str, object] = {}
+        # 记录已推送低余额提醒的用户（避免一天内重复推送）：{umo: date}
+        low_balance_pushed_users: dict[str, object] = {}
+
+        while True:
+            try:
+                now = datetime.now(tz=CST)
+
+                # ── 计算下次唤醒时间 ──────────────────────────────────────
+                if self.poll_interval > 0:
+                    # 自定义间隔：直接等待指定分钟数
+                    wait_seconds = self.poll_interval * 60
+                    next_desc = f"{self.poll_interval} 分钟后"
+                else:
+                    # 默认：对齐到下一个整点
+                    if now.minute == 0 and now.second < 30:
+                        # 当前已在整点30秒内，直接执行（wait=0）
+                        wait_seconds = 0
+                    else:
+                        next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+                        wait_seconds = (next_hour - now).total_seconds()
+                    next_desc = f"下一整点 {(now + timedelta(seconds=wait_seconds)).strftime('%H:%M')} (CST)"
+
+                if wait_seconds > 0:
+                    logger.info(f"电费推送任务将在 {next_desc} 后执行")
+                    await asyncio.sleep(wait_seconds)
+
+                # ── 执行本轮检查 ─────────────────────────────────────────
+                now = datetime.now(tz=CST)
+                current_hour = now.hour
+                current_date = now.date()
+
+                # 清理过期推送记录（非今日）
+                pushed_users = {k: v for k, v in pushed_users.items() if v == current_date}
+                low_balance_pushed_users = {k: v for k, v in low_balance_pushed_users.items() if v == current_date}
+
+                scheduled_push_count = 0
+                low_balance_push_count = 0
+
+                if self.subscribers:
+                    for umo, user_data in list(self.subscribers.items()):
+                        try:
+                            room_id = user_data["room_id"]
+                            threshold = user_data.get("threshold", self.default_threshold)
+                            need_fetch = (
+                                user_data.get("push_enabled", False) or
+                                user_data.get("low_balance_push_enabled", False)
+                            )
+                            data = await self._fetch_elect_data(room_id) if need_fetch else None
+
+                            # 1. 定时推送
+                            if user_data.get("push_enabled", False):
+                                push_time = user_data.get("push_time", self.default_push_time)
+                                if push_time == current_hour:
+                                    if umo not in pushed_users or pushed_users[umo] != current_date:
+                                        if data:
+                                            msg = "[每日电费推送]\n" + self._format_elect_message(data, threshold)
+                                            await self.context.send_message(umo, MessageChain().message(msg))
+                                            pushed_users[umo] = current_date
+                                            scheduled_push_count += 1
+                                            logger.info(f"定时推送: {umo} -> {room_id} ({push_time}:00 CST)")
+                                        else:
+                                            logger.warning(f"定时推送获取数据失败: {room_id}")
+
+                            # 2. 低余额推送
+                            if user_data.get("low_balance_push_enabled", False):
+                                if data:
+                                    remaining = data.get("remaining", 0)
+                                    if remaining < threshold:
+                                        if umo not in low_balance_pushed_users or low_balance_pushed_users[umo] != current_date:
+                                            msg = "[低余额提醒]\n" + self._format_elect_message(data, threshold)
+                                            await self.context.send_message(umo, MessageChain().message(msg))
+                                            low_balance_pushed_users[umo] = current_date
+                                            low_balance_push_count += 1
+                                            logger.info(f"低余额推送: {umo} -> {room_id} (余额 {remaining}元 < 阈值 {threshold}元)")
+                                    else:
+                                        # 余额恢复，重置当日提醒状态
+                                        low_balance_pushed_users.pop(umo, None)
+                                else:
+                                    logger.warning(f"低余额检查获取数据失败: {room_id}")
+
+                        except Exception as e:
+                            logger.error(f"推送失败 ({umo}): {e}")
+
+                if scheduled_push_count > 0 or low_balance_push_count > 0:
+                    logger.info(
+                        f"推送完成 [{now.strftime('%H:%M CST')}] - "
+                        f"定时: {scheduled_push_count}人, 低余额: {low_balance_push_count}人"
+                    )
+
+                # 自定义间隔时无需额外等待；整点对齐时补一个短延迟防止重入
+                if self.poll_interval == 0:
+                    await asyncio.sleep(65)
+
+            except asyncio.CancelledError:
+                logger.info("电费定时推送任务已取消")
+                break
+            except Exception as e:
+                logger.error(f"电费定时推送任务出错: {e}")
+                await asyncio.sleep(60)
