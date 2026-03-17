@@ -1,6 +1,6 @@
 name: astrbot_plugin_ctbu_elect
 display_name: CTBU 电费查询与推送
 desc: 重庆工商大学电费查询与自动推送插件，支持订阅每日推送和低费用警告
-version: v1.3.2
+version: v1.3.3
 author: "236233"
 repo: https://github.com/236233/astrbot_plugin_ctbu_elect

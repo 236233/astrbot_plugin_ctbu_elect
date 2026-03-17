@@ -3,7 +3,7 @@ import asyncio
 import re
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star
 from astrbot.api import logger
 
@@ -1078,7 +1078,7 @@ class CTBUElectPlugin(Star):
                                                 # 文转图模式
                                                 image_url = await self._render_elect_image(data, threshold, "[每日电费推送]")
                                                 if image_url:
-                                                    chain = MessageChain().image(image_url)
+                                                    chain = MessageChain().url_image(image_url)
                                                     # 低余额时额外发送缴费链接
                                                     if data.get("remaining", 0) < threshold:
                                                         chain.message(f"\n━━━━━━━━━━━━━━\n缴费入口:\n{self.pay_url}")
@@ -1109,7 +1109,7 @@ class CTBUElectPlugin(Star):
                                                 # 文转图模式
                                                 image_url = await self._render_elect_image(data, threshold, "[低余额提醒]")
                                                 if image_url:
-                                                    chain = MessageChain().image(image_url)
+                                                    chain = MessageChain().url_image(image_url)
                                                     # 额外发送缴费链接
                                                     chain.message(f"\n━━━━━━━━━━━━━━\n缴费入口:\n{self.pay_url}")
                                                     await self.context.send_message(umo, chain)
