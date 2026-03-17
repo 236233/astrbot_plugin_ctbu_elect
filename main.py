@@ -18,7 +18,7 @@ ELECT_HTML_TEMPLATE = '''
     <meta charset="UTF-8">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@24,400,1,0" rel="stylesheet">
     <style>
         * {
@@ -28,170 +28,173 @@ ELECT_HTML_TEMPLATE = '''
         }
 
         body {
-            font-family: 'Google Sans', 'PingFang SC', -apple-system, 'Microsoft YaHei', sans-serif;
+            font-family: 'Google Sans', 'Noto Sans SC', 'PingFang SC', -apple-system, 'Microsoft YaHei', sans-serif;
             background: #EDF5F7;
-            padding: 32px;
+            padding: 24px;
             min-height: 100vh;
+            width: fit-content;  /* 宽度适应内容 */
             display: flex;
-            align-items: center;
-            justify-content: center;
+            align-items: flex-start;
+            justify-content: flex-start;
         }
 
         .container {
             background: #FEFEFE;
-            border-radius: 28px;
+            border-radius: 36px;
             padding: 0;
             box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05),
                         0 4px 12px rgba(0, 0, 0, 0.06);
-            max-width: 560px;
-            width: 100%;
+            width: 630px;
+            min-height: 870px;
             overflow: hidden;
+            margin: 0;
         }
 
         .header {
             background: #C5DDE8;
-            padding: 32px 32px 28px;
-            text-align: left;
+            padding: 36px 36px 30px;
+            text-align: center;
         }
 
         .title {
-            font-size: 38px;
+            font-size: 48px;
             font-weight: 500;
             color: #2D4356;
-            letter-spacing: -0.5px;
-            margin-bottom: 8px;
+            letter-spacing: -0.75px;
+            margin-bottom: 9px;
         }
 
         .subtitle {
-            font-size: 18px;
+            font-size: 24px;
             font-weight: 400;
             color: #5A6C7D;
-            letter-spacing: 0.25px;
+            letter-spacing: 0.375px;
         }
 
         .content {
-            padding: 28px 32px 32px;
+            padding: 30px 36px 36px;
         }
 
         .balance-card {
             background: #E8F3F8;
-            border-radius: 20px;
-            padding: 28px;
-            margin-bottom: 20px;
+            border-radius: 27px;
+            padding: 33px;
+            margin-bottom: 24px;
         }
 
         .balance-label {
-            font-size: 17px;
+            font-size: 22.5px;
             font-weight: 500;
             color: #5A6C7D;
-            letter-spacing: 0.5px;
+            letter-spacing: 0.75px;
             text-transform: uppercase;
-            margin-bottom: 12px;
+            margin-bottom: 15px;
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 9px;
         }
 
         .balance-value {
-            font-size: 76px;
+            font-size: 96px;
             font-weight: 700;
             color: {% if remaining < threshold %}#D89B9B{% else %}#9BC4BC{% endif %};
-            letter-spacing: -2px;
+            letter-spacing: -3px;
             line-height: 1;
         }
 
         .balance-unit {
-            font-size: 28px;
+            font-size: 36px;
             font-weight: 500;
             color: {% if remaining < threshold %}#B08080{% else %}#7FA9A3{% endif %};
-            margin-left: 4px;
+            margin-left: 6px;
         }
 
         .info-grid {
             display: grid;
-            gap: 16px;
-            margin-bottom: 20px;
+            gap: 18px;
+            margin-bottom: 24px;
         }
 
         .info-item {
             background: #F8FAFB;
-            border-radius: 16px;
-            padding: 22px;
-            border-left: 4px solid #C9DAE8;
+            border-radius: 21px;
+            padding: 27px;
+            border-left: 4.5px solid #C9DAE8;
         }
 
         .info-label {
-            font-size: 16px;
+            font-size: 21px;
             font-weight: 500;
             color: #7A8A99;
-            letter-spacing: 0.4px;
+            letter-spacing: 0.6px;
             text-transform: uppercase;
-            margin-bottom: 8px;
+            margin-bottom: 9px;
             display: flex;
             align-items: center;
-            gap: 6px;
+            gap: 7.5px;
         }
 
         .info-value {
-            font-size: 22px;
+            font-size: 27px;
             font-weight: 500;
             color: #2D4356;
-            letter-spacing: -0.2px;
+            letter-spacing: -0.3px;
+            line-height: 1.3;
         }
 
         .material-symbols-rounded {
-            font-size: 22px;
+            font-size: 27px;
             vertical-align: middle;
         }
 
         {% if remaining < threshold %}
         .alert {
             background: #F5DDE0;
-            border-radius: 16px;
-            padding: 22px 26px;
-            margin-bottom: 20px;
-            border-left: 4px solid #D89B9B;
+            border-radius: 21px;
+            padding: 27px 30px;
+            margin-bottom: 24px;
+            border-left: 4.5px solid #D89B9B;
         }
 
         .alert-title {
-            font-size: 21px;
+            font-size: 25.5px;
             font-weight: 600;
             color: #7A5555;
-            margin-bottom: 10px;
-            letter-spacing: -0.2px;
+            margin-bottom: 12px;
+            letter-spacing: -0.3px;
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 9px;
         }
 
         .alert-text {
-            font-size: 18px;
+            font-size: 22.5px;
             font-weight: 400;
             color: #95686B;
-            line-height: 1.6;
-            letter-spacing: 0.1px;
+            line-height: 1.5;
+            letter-spacing: 0.15px;
         }
         {% endif %}
 
         .footer {
             background: #F8FAFB;
-            padding: 18px 32px;
+            padding: 21px 36px;
             text-align: center;
             border-top: 1px solid #E8EBED;
         }
 
         .footer-text {
-            font-size: 15px;
+            font-size: 19.5px;
             font-weight: 400;
             color: #9AA5B1;
-            letter-spacing: 0.3px;
+            letter-spacing: 0.45px;
         }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <div class="title">电费查询</div>
+            <div class="title">电费详情</div>
             {% if prefix %}
             <div class="subtitle">{{ prefix }}</div>
             {% endif %}
@@ -244,14 +247,12 @@ ELECT_HTML_TEMPLATE = '''
         </div>
 
         <div class="footer">
-            <div class="footer-text">CTBU 电费查询插件</div>
+            <div class="footer-text">ASTRBOT-PLUGIN-CTBU-ELECT</div>
         </div>
     </div>
 </body>
 </html>
 '''
-
-
 class CTBUElectPlugin(Star):
     '''CTBU 电费查询与自动推送插件'''
 
@@ -470,10 +471,20 @@ class CTBUElectPlugin(Star):
 
         # 渲染配置
         options = {
-            "type": "png",
+            "type": "jpeg",
+            "quality": 95,
             "full_page": True,
-            "omit_background": False
+            "scale": "device",
+            "timeout": 10000,
+             "clip": {
+                "x": 0,
+                "y": 0,
+                "width": 680,
+                "height":2000
+            }
+            
         }
+        
 
         # 使用 html_render 生成图片
         try:
