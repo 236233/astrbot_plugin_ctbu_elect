@@ -10,12 +10,255 @@ from astrbot.api import logger
 # 东八区时区
 CST = timezone(timedelta(hours=8))
 
+# HTML 模板用于文转图渲染
+ELECT_HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@24,400,1,0" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Google Sans', 'PingFang SC', -apple-system, 'Microsoft YaHei', sans-serif;
+            background: #EDF5F7;
+            padding: 32px;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .container {
+            background: #FEFEFE;
+            border-radius: 28px;
+            padding: 0;
+            box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05),
+                        0 4px 12px rgba(0, 0, 0, 0.06);
+            max-width: 560px;
+            width: 100%;
+            overflow: hidden;
+        }
+
+        .header {
+            background: #C5DDE8;
+            padding: 32px 32px 28px;
+            text-align: left;
+        }
+
+        .title {
+            font-size: 38px;
+            font-weight: 500;
+            color: #2D4356;
+            letter-spacing: -0.5px;
+            margin-bottom: 8px;
+        }
+
+        .subtitle {
+            font-size: 18px;
+            font-weight: 400;
+            color: #5A6C7D;
+            letter-spacing: 0.25px;
+        }
+
+        .content {
+            padding: 28px 32px 32px;
+        }
+
+        .balance-card {
+            background: #E8F3F8;
+            border-radius: 20px;
+            padding: 28px;
+            margin-bottom: 20px;
+        }
+
+        .balance-label {
+            font-size: 17px;
+            font-weight: 500;
+            color: #5A6C7D;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+            margin-bottom: 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .balance-value {
+            font-size: 76px;
+            font-weight: 700;
+            color: {% if remaining < threshold %}#D89B9B{% else %}#9BC4BC{% endif %};
+            letter-spacing: -2px;
+            line-height: 1;
+        }
+
+        .balance-unit {
+            font-size: 28px;
+            font-weight: 500;
+            color: {% if remaining < threshold %}#B08080{% else %}#7FA9A3{% endif %};
+            margin-left: 4px;
+        }
+
+        .info-grid {
+            display: grid;
+            gap: 16px;
+            margin-bottom: 20px;
+        }
+
+        .info-item {
+            background: #F8FAFB;
+            border-radius: 16px;
+            padding: 22px;
+            border-left: 4px solid #C9DAE8;
+        }
+
+        .info-label {
+            font-size: 16px;
+            font-weight: 500;
+            color: #7A8A99;
+            letter-spacing: 0.4px;
+            text-transform: uppercase;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .info-value {
+            font-size: 22px;
+            font-weight: 500;
+            color: #2D4356;
+            letter-spacing: -0.2px;
+        }
+
+        .material-symbols-rounded {
+            font-size: 22px;
+            vertical-align: middle;
+        }
+
+        {% if remaining < threshold %}
+        .alert {
+            background: #F5DDE0;
+            border-radius: 16px;
+            padding: 22px 26px;
+            margin-bottom: 20px;
+            border-left: 4px solid #D89B9B;
+        }
+
+        .alert-title {
+            font-size: 21px;
+            font-weight: 600;
+            color: #7A5555;
+            margin-bottom: 10px;
+            letter-spacing: -0.2px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .alert-text {
+            font-size: 18px;
+            font-weight: 400;
+            color: #95686B;
+            line-height: 1.6;
+            letter-spacing: 0.1px;
+        }
+        {% endif %}
+
+        .footer {
+            background: #F8FAFB;
+            padding: 18px 32px;
+            text-align: center;
+            border-top: 1px solid #E8EBED;
+        }
+
+        .footer-text {
+            font-size: 15px;
+            font-weight: 400;
+            color: #9AA5B1;
+            letter-spacing: 0.3px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="title">电费查询</div>
+            {% if prefix %}
+            <div class="subtitle">{{ prefix }}</div>
+            {% endif %}
+        </div>
+
+        <div class="content">
+            <div class="balance-card">
+                <div class="balance-label">
+                    <span class="material-symbols-rounded">account_balance_wallet</span>
+                    当前余额
+                </div>
+                <div class="balance-value">{{ remaining }}<span class="balance-unit">元</span></div>
+            </div>
+
+            <div class="info-grid">
+                <div class="info-item">
+                    <div class="info-label">
+                        <span class="material-symbols-rounded">location_on</span>
+                        位置信息
+                    </div>
+                    <div class="info-value">{{ campus }} {{ building_name }} {{ pid }}室</div>
+                </div>
+
+                <div class="info-item">
+                    <div class="info-label">
+                        <span class="material-symbols-rounded">bar_chart</span>
+                        累计消耗
+                    </div>
+                    <div class="info-value">{{ total_used }} 元</div>
+                </div>
+
+                <div class="info-item">
+                    <div class="info-label">
+                        <span class="material-symbols-rounded">schedule</span>
+                        结算时间
+                    </div>
+                    <div class="info-value">{{ update_time }}</div>
+                </div>
+            </div>
+
+            {% if remaining < threshold %}
+            <div class="alert">
+                <div class="alert-title">
+                    <span class="material-symbols-rounded">warning</span>
+                    余额不足提醒
+                </div>
+                <div class="alert-text">当前余额低于 {{ threshold }} 元，建议尽快充值</div>
+            </div>
+            {% endif %}
+        </div>
+
+        <div class="footer">
+            <div class="footer-text">CTBU 电费查询插件</div>
+        </div>
+    </div>
+</body>
+</html>
+'''
+
 
 class CTBUElectPlugin(Star):
     '''CTBU 电费查询与自动推送插件'''
 
-    def __init__(self, context: Context):
-        super().__init__(context)
+    def __init__(self, context: Context, config: dict = None):
+        super().__init__(context, config)
+        # 从配置读取文转图渲染模式
+        self.render_mode = config.get("render_mode", False) if config else False
         # 校区前缀映射
         self.CAMPUS_PREFIX = {
             "cy": ("茶园校区", "茶园{building}栋"),      # 茶园10-19栋
@@ -42,6 +285,7 @@ class CTBUElectPlugin(Star):
     async def initialize(self):
         """插件初始化，加载订阅数据并启动定时推送任务"""
         logger.info("CTBU 电费插件初始化中...")
+        logger.info(f"渲染模式: {'文转图' if self.render_mode else '纯文本'}")
         # 从 KV 存储加载订阅数据
         self.subscribers = await self.get_kv_data("subscribers", {})
         logger.info(f"已加载 {len(self.subscribers)} 个订阅")
@@ -194,6 +438,52 @@ class CTBUElectPlugin(Star):
 
         return message
 
+    async def _render_elect_image(self, data: dict, threshold: float = None, prefix: str = "") -> str:
+        """
+        使用文转图方式渲染电费信息
+        :param data: 电费数据
+        :param threshold: 低余额阈值
+        :param prefix: 可选的前缀文本（如 "[每日电费推送]"）
+        :return: 图片 URL
+        """
+        if threshold is None:
+            threshold = self.default_threshold
+
+        room_id = data["room_id"]
+        parsed = self._parse_room_id(room_id)
+        if not parsed:
+            return None
+
+        campus, building_name, pid, _ = parsed
+
+        # 准备渲染数据
+        render_data = {
+            "campus": campus,
+            "building_name": building_name,
+            "pid": pid,
+            "remaining": data["remaining"],
+            "total_used": data["total_used"],
+            "update_time": data["update_time"],
+            "threshold": threshold,
+            "prefix": prefix
+        }
+
+        # 渲染配置
+        options = {
+            "type": "png",
+            "full_page": True,
+            "omit_background": False
+        }
+
+        # 使用 html_render 生成图片
+        try:
+            url = await self.html_render(ELECT_HTML_TEMPLATE, render_data, return_url=True, options=options)
+            logger.info(f"文转图渲染成功: {url}")
+            return url
+        except Exception as e:
+            logger.error(f"文转图渲染失败: {e}")
+            return None
+
     def _get_help_message(self) -> str:
         """获取帮助信息"""
         return (
@@ -279,8 +569,27 @@ class CTBUElectPlugin(Star):
         data = await self._fetch_elect_data(room_id)
         if data:
             threshold = await self._get_user_threshold(umo)
-            message = self._format_elect_message(data, threshold)
-            yield event.plain_result(message)
+
+            # 根据 render_mode 决定输出方式
+            if self.render_mode:
+                # 文转图模式
+                image_url = await self._render_elect_image(data, threshold)
+                if image_url:
+                    yield event.image_result(image_url)
+                    # 低余额时额外发送缴费链接
+                    if data["remaining"] < threshold:
+                        yield event.plain_result(
+                            f"━━━━━━━━━━━━━━\n"
+                            f"缴费入口:\n{self.pay_url}"
+                        )
+                else:
+                    # 渲染失败，降级为纯文本
+                    message = self._format_elect_message(data, threshold)
+                    yield event.plain_result(message)
+            else:
+                # 纯文本模式
+                message = self._format_elect_message(data, threshold)
+                yield event.plain_result(message)
         else:
             yield event.plain_result(
                 f"[错误] 查询失败\n"
@@ -753,8 +1062,25 @@ class CTBUElectPlugin(Star):
                                 if push_time == current_hour:
                                     if umo not in pushed_users or pushed_users[umo] != current_date:
                                         if data:
-                                            msg = "[每日电费推送]\n" + self._format_elect_message(data, threshold)
-                                            await self.context.send_message(umo, MessageChain().message(msg))
+                                            # 根据 render_mode 选择推送方式
+                                            if self.render_mode:
+                                                # 文转图模式
+                                                image_url = await self._render_elect_image(data, threshold, "[每日电费推送]")
+                                                if image_url:
+                                                    chain = MessageChain().image(image_url)
+                                                    # 低余额时额外发送缴费链接
+                                                    if data.get("remaining", 0) < threshold:
+                                                        chain.message(f"\n━━━━━━━━━━━━━━\n缴费入口:\n{self.pay_url}")
+                                                    await self.context.send_message(umo, chain)
+                                                else:
+                                                    # 渲染失败，降级为纯文本
+                                                    msg = "[每日电费推送]\n" + self._format_elect_message(data, threshold)
+                                                    await self.context.send_message(umo, MessageChain().message(msg))
+                                            else:
+                                                # 纯文本模式
+                                                msg = "[每日电费推送]\n" + self._format_elect_message(data, threshold)
+                                                await self.context.send_message(umo, MessageChain().message(msg))
+
                                             pushed_users[umo] = current_date
                                             scheduled_push_count += 1
                                             logger.info(f"定时推送: {umo} -> {room_id} ({push_time}:00 CST)")
@@ -767,8 +1093,24 @@ class CTBUElectPlugin(Star):
                                     remaining = data.get("remaining", 0)
                                     if remaining < threshold:
                                         if umo not in low_balance_pushed_users or low_balance_pushed_users[umo] != current_date:
-                                            msg = "[低余额提醒]\n" + self._format_elect_message(data, threshold)
-                                            await self.context.send_message(umo, MessageChain().message(msg))
+                                            # 根据 render_mode 选择推送方式
+                                            if self.render_mode:
+                                                # 文转图模式
+                                                image_url = await self._render_elect_image(data, threshold, "[低余额提醒]")
+                                                if image_url:
+                                                    chain = MessageChain().image(image_url)
+                                                    # 额外发送缴费链接
+                                                    chain.message(f"\n━━━━━━━━━━━━━━\n缴费入口:\n{self.pay_url}")
+                                                    await self.context.send_message(umo, chain)
+                                                else:
+                                                    # 渲染失败，降级为纯文本
+                                                    msg = "[低余额提醒]\n" + self._format_elect_message(data, threshold)
+                                                    await self.context.send_message(umo, MessageChain().message(msg))
+                                            else:
+                                                # 纯文本模式
+                                                msg = "[低余额提醒]\n" + self._format_elect_message(data, threshold)
+                                                await self.context.send_message(umo, MessageChain().message(msg))
+
                                             low_balance_pushed_users[umo] = current_date
                                             low_balance_push_count += 1
                                             logger.info(f"低余额推送: {umo} -> {room_id} (余额 {remaining}元 < 阈值 {threshold}元)")
