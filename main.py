@@ -2,7 +2,7 @@ import aiohttp
 import asyncio
 import re
 from datetime import datetime, timezone, timedelta
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star
 from astrbot.api import logger
@@ -254,7 +254,7 @@ ELECT_HTML_TEMPLATE = '''
 </html>
 '''
 class CTBUElectPlugin(Star):
-    '''CTBU 电费查询与自动推送插件'''
+    '''CTBU 电费小助手插件'''
 
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context, config)
@@ -270,7 +270,7 @@ class CTBUElectPlugin(Star):
         }
         # 电费查询 URL 基础地址
         self.base_url = "https://hqpay.ctbu.edu.cn/weixin/ashx/frmuser.ashx"
-        # 缴费入口 URL
+        # 自助查询缴费系统 URL
         self.pay_url = "https://hqpay.ctbu.edu.cn/weixin/index.html"
         # 存储订阅用户: {unified_msg_origin: {"room_id": str, "threshold": float, "push_enabled": bool, "push_time": int, "low_balance_push_enabled": bool}}
         self.subscribers: dict[str, dict] = {}
@@ -406,7 +406,7 @@ class CTBUElectPlugin(Star):
         """
         格式化电费信息
         :param data: 电费数据
-        :param threshold: 低余额阈值，低于此值时显示缴费入口
+        :param threshold: 低余额阈值，低于此值时显示自助缴费系统链接
         """
         if threshold is None:
             threshold = self.default_threshold
@@ -429,15 +429,124 @@ class CTBUElectPlugin(Star):
             f"结算: {data['update_time']}"
         )
 
-        # 低余额提醒和缴费入口
+        # 低余额提醒和自助缴费系统链接
         if remaining < threshold:
             message += (
                 f"\n\n[!] 余额不足 {threshold} 元，请尽快充值！\n"
                 f"━━━━━━━━━━━━━━\n"
-                f"缴费入口:\n{self.pay_url}"
+                f"自助缴费系统:\n{self.pay_url}"
             )
 
         return message
+
+    def _extract_viewstate(self, html: str) -> str | None:
+        """提取 ASP.NET 页面令牌 __VIEWSTATE"""
+        pattern = r'name="__VIEWSTATE"[^>]*value="([^"]*)"'
+        match = re.search(pattern, html, re.I)
+        return match.group(1) if match else None
+
+    def _validate_charge(self, balance: float, amount: float) -> tuple[bool, str]:
+        """
+        校验充值金额
+        :return: (是否有效, 错误信息)
+        """
+        if amount <= 0:
+            return False, "充值金额必须大于 0"
+        if balance < 0 and amount < abs(balance):
+            return False, f"充值金额不足: 当前欠费 {abs(balance):.2f} 元，需充值至少 {abs(balance):.2f} 元"
+        return True, ""
+
+    async def _get_payment_link(self, room_id: str, amount: float) -> dict:
+        """
+        获取电费充值支付链接
+        :param room_id: 房间号（格式如 cy10-101）
+        :param amount: 充值金额（元）
+        :return: {"success": bool, "message": str, "pay_url": str|None, "balance": float|None}
+        """
+        parsed = self._parse_room_id(room_id)
+        if not parsed:
+            return {"success": False, "message": "房间号格式错误", "pay_url": None, "balance": None}
+
+        campus, building_name, pid, _ = parsed
+        base_url = "https://hqpay.ctbu.edu.cn"
+        timeout = aiohttp.ClientTimeout(total=15)
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        }
+
+        try:
+            connector = aiohttp.TCPConnector(ssl=False)
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                # 设置用户信息 Cookie
+                session.cookie_jar.update_cookies({
+                    "schoolname": quote(campus, safe=''),
+                    "dyname": quote(building_name, safe=''),
+                    "mphname": quote(pid, safe=''),
+                })
+
+                # Step 1: 获取支付页面并提取 __VIEWSTATE
+                page_url = f"{base_url}/weixin/WebPay.aspx"
+                async with session.get(page_url, headers=headers) as resp:
+                    if resp.status != 200:
+                        return {"success": False, "message": f"获取支付页面失败 (状态码: {resp.status})", "pay_url": None, "balance": None}
+                    html = await resp.text()
+
+                viewstate = self._extract_viewstate(html)
+                if not viewstate:
+                    return {"success": False, "message": "页面令牌提取失败，请稍后重试", "pay_url": None, "balance": None}
+
+                # Step 2: 查询余额
+                balance_url = f"{base_url}/weixin/ashx/frmuser.ashx"
+                balance_params = {"test": "lastlist", "pid": pid, "dyid": building_name}
+                balance_headers = {**headers, "X-Requested-With": "XMLHttpRequest"}
+
+                async with session.get(balance_url, params=balance_params, headers=balance_headers) as resp:
+                    if resp.status != 200:
+                        return {"success": False, "message": "余额查询失败", "pay_url": None, "balance": None}
+                    data = await resp.json(content_type=None)
+                    if not data or not isinstance(data, list) or len(data[0]) < 2:
+                        return {"success": False, "message": "余额数据解析失败", "pay_url": None, "balance": None}
+                    balance = float(data[0][1])
+
+                # Step 3: 校验充值金额
+                valid, err_msg = self._validate_charge(balance, amount)
+                if not valid:
+                    return {"success": False, "message": err_msg, "pay_url": None, "balance": balance}
+
+                # Step 4: 提交充值表单
+                form_data = {
+                    "__VIEWSTATE": viewstate,
+                    "schoolname": campus,
+                    "dyname": building_name,
+                    "mphname": pid,
+                    "moninfo": str(balance),
+                    "hidBill": "",
+                    "jrtxt": str(int(amount)),
+                    "Button1": "提交",
+                }
+                submit_headers = {**headers, "Referer": base_url}
+
+                async with session.post(page_url, headers=submit_headers, data=form_data, allow_redirects=False) as resp:
+                    if resp.status == 302 and resp.headers.get("Location"):
+                        pay_link = resp.headers["Location"]
+                        if pay_link.startswith("/"):
+                            pay_link = f"{base_url}{pay_link}"
+                        # 安全检测：验证支付链接域名
+                        parsed_url = urlparse(pay_link)
+                        if parsed_url.netloc != "cwxsjf.ctbu.edu.cn":
+                            logger.warning(f"支付链接域名异常: {parsed_url.netloc}")
+                            return {"success": False, "message": "安全警告：支付链接域名异常，请注意自查来源是否被篡改", "pay_url": None, "balance": balance}
+                        return {"success": True, "message": "充值请求成功", "pay_url": pay_link, "balance": balance}
+                    else:
+                        return {"success": False, "message": "充值请求未返回支付链接，请检查房间信息", "pay_url": None, "balance": balance}
+
+        except asyncio.TimeoutError:
+            return {"success": False, "message": "请求超时，请稍后重试", "pay_url": None, "balance": None}
+        except Exception as e:
+            logger.error(f"获取支付链接失败: {e}")
+            return {"success": False, "message": f"请求异常: {str(e)}", "pay_url": None, "balance": None}
 
     async def _render_elect_image(self, data: dict, threshold: float = None, prefix: str = "") -> str:
         """
@@ -529,15 +638,19 @@ class CTBUElectPlugin(Star):
             "  /设置阈值 15           设置低余额阈值\n"
             "  /设置轮询间隔 0        设置轮询间隔(0=整点)\n"
             "  /我的订阅              查看当前配置\n"
-            "  /缴费                 快速获取缴费入口\n\n"
+            "  /缴费                 跳转自助查询缴费系统\n"
+            "  /快捷充值 50           一键充值(实验性,上限100)\n"
+            "  /确认充值免责          首次充值需确认免责\n\n"
             "使用建议\n"
             "━━━━━━━━━━━━━━\n"
             "1. 首次使用: /订阅电费 <房间号>\n"
             "2. 开启定时推送: /开启推送\n"
             "3. 开启低余额推送: /开启低余额推送\n"
             "4. 设置推送时间: /设置推送时间 <小时>\n"
-            "5. 两种推送可独立开关，互不影响\n"
-            "6. 所有时间均为东八区 (UTC+8)"
+            "5. 快捷充值(实验性): /快捷充值 <金额>\n"
+            "   (首次需 /确认充值免责，上限100元)\n"
+            "6. 两种推送可独立开关，互不影响\n"
+            "7. 所有时间均为东八区 (UTC+8)"
         )
 
     async def _get_user_threshold(self, umo: str) -> float:
@@ -587,11 +700,11 @@ class CTBUElectPlugin(Star):
                 image_url = await self._render_elect_image(data, threshold)
                 if image_url:
                     yield event.image_result(image_url)
-                    # 低余额时额外发送缴费链接
+                    # 低余额时额外发送自助缴费系统链接
                     if data["remaining"] < threshold:
                         yield event.plain_result(
                             f"━━━━━━━━━━━━━━\n"
-                            f"缴费入口:\n{self.pay_url}"
+                            f"自助缴费系统:\n{self.pay_url}"
                         )
                 else:
                     # 渲染失败，降级为纯文本
@@ -659,9 +772,14 @@ class CTBUElectPlugin(Star):
         umo = event.unified_msg_origin
         existing = self.subscribers.get(umo)
         if existing:
-            # 已订阅用户：只更新房间号和阈值，保留推送设置
+            # 已订阅用户：更新房间号和阈值
+            old_room_id = existing.get("room_id")
             existing["room_id"] = room_id
             existing["threshold"] = threshold_value
+            # 更换房间时，重置免责确认状态，需要重新阅读并确认
+            if old_room_id != room_id:
+                existing["recharge_disclaimer_confirmed"] = False
+                existing["recharge_disclaimer_shown"] = False
         else:
             self.subscribers[umo] = {
                 "room_id": room_id,
@@ -742,7 +860,7 @@ class CTBUElectPlugin(Star):
                 f"━━━━━━━━━━━━━━\n"
                 f"房间: {self.subscribers[umo]['room_id']}\n"
                 f"新阈值: {threshold_value} 元\n"
-                f"余额低于此值时将自动显示缴费入口"
+                f"余额低于此值时将自动显示自助缴费系统链接"
             )
         else:
             yield event.plain_result(
@@ -970,15 +1088,176 @@ class CTBUElectPlugin(Star):
             f"说明: 重启任务后生效，当前任务将在下次唤醒时采用新间隔"
         )
 
-    @filter.command("缴费", alias={"电费充值", "充值电费", "pay_elect"})
+    @filter.command("缴费", alias={"pay_elect"})
     async def pay_elect(self, event: AstrMessageEvent):
-        """获取电费缴费链接"""
+        """跳转自助查询缴费系统"""
         yield event.plain_result(
-            "电费缴费入口\n"
+            "自助查询缴费系统\n"
             "━━━━━━━━━━━━━━\n"
-            "请点击以下链接进行缴费:\n"
+            "请点击以下链接跳转缴费系统:\n"
             f"{self.pay_url}\n\n"
-            "提示: 建议先通过 /电费 命令查询余额后再充值"
+        )
+
+    @filter.command("快捷充值", alias={"一键充值", "充电费", "快速充值", "recharge"})
+    async def quick_recharge(self, event: AstrMessageEvent, amount: str = ""):
+        """
+        快捷充值电费（一键获取支付链接）
+        :param amount: 充值金额（元）
+        """
+        umo = event.unified_msg_origin
+
+        # 检查是否已绑定房间
+        if umo not in self.subscribers:
+            yield event.plain_result(
+                "[提示] 您还未绑定房间\n\n"
+                "请先使用 /订阅电费 <房间号> 绑定房间\n"
+                "示例: /订阅电费 cy10-101\n\n"
+                "绑定后即可使用快捷充值功能"
+            )
+            return
+
+        room_id = self.subscribers[umo]["room_id"]
+
+        # 校验金额
+        if not amount:
+            yield event.plain_result(
+                "快捷充值说明（实验性功能）\n"
+                "━━━━━━━━━━━━━━\n"
+                "使用方法: /快捷充值 <金额>\n"
+                "示例: /快捷充值 100\n\n"
+                f"当前绑定房间: {room_id}\n\n"
+                "说明:\n"
+                "1. 金额必须为正整数（1-100元）\n"
+                "2. 如有欠费，充值金额需大于欠费额\n"
+                "3. 获取链接后可进行支付\n"
+                "4. 注意: 建议先以最低金额进行试探性充值\n"
+                "   请务必确认房间和金额，避免错误。\n\n"
+                "   [提示] 确认免责声明后，请使用 /确认免责声明 命令\n"
+                "   [提示] 确认免责声明后，请使用 /快捷充值 <金额> 命令\n"
+                "   [提示] 确认免责声明后，请使用 /查询电费 命令查询余额\n"
+                "5. 充值成功后请务必使用 /查询电费 命令查询余额"
+            )
+            return
+
+        # 检查是否已确认免责声明（首次使用需确认）
+        if not self.subscribers[umo].get("recharge_disclaimer_confirmed", False):
+            # 标记已显示免责声明（防止用户直接调用确认命令跳过阅读）
+            self.subscribers[umo]["recharge_disclaimer_shown"] = True
+            await self.put_kv_data("subscribers", self.subscribers)
+
+            yield event.plain_result(
+                "快捷充值服务免责声明（实验性功能）\n"
+                "====================\n"
+                "本工具仅作为重庆工商大学官方支付链接的技术中转服务，\n"
+                "使用前请务必仔细阅读并同意以下条款：\n\n"
+                "1. 本功能仅提供链接获取便利，\n"
+                "   不担保链接的长期有效性与技术稳定性。\n"
+                "2. 支付前请务必仔细核对\n"
+                "   收款方信息、房间号及充值金额。\n"
+                "3. 因用户个人操作失误导致的\n"
+                "   资金损失，均由用户自行承担，\n"
+                "   开发者对此不承担任何法律责任。\n"
+                "4. 实际支付行为由学校官方收款平台\n"
+                "   独立完成，本工具不接触任何资金。\n"
+                "   请确保使用正规来源插件，警惕第三方\n"
+                "   篡改链接风险，注意资金安全。\n"
+                "5. 使用建议：首次使用或链接更新后，\n"
+                "   建议先以最低金额进行试探性充值，\n"
+                "   确认充值流程与余额查询正常后再进行大额操作。\n\n"
+                "====================\n"
+                f"当前绑定房间：{room_id}\n\n"
+                "如已阅读并同意以上内容，请发送：\n"
+                "/确认充值免责\n\n"
+                "确认后即可正常使用快捷充值功能"
+            )
+            return
+
+        try:
+            amount_value = float(amount)
+            if amount_value != int(amount_value) or amount_value <= 0:
+                yield event.plain_result("[错误] 金额必须为正整数")
+                return
+            amount_value = int(amount_value)
+            if amount_value > 100:
+                yield event.plain_result("[错误] 单次充值金额不能超过 100 元（实验性功能限制）")
+                return
+        except ValueError:
+            yield event.plain_result("[错误] 请输入有效的金额数字")
+            return
+
+        yield event.plain_result(f"正在获取 {room_id} 的支付链接，充值金额: {amount_value} 元...")
+
+        result = await self._get_payment_link(room_id, amount_value)
+
+        if result["success"]:
+            balance = result["balance"]
+            status = f"欠费 {abs(balance):.2f} 元" if balance < 0 else f"余额 {balance:.2f} 元"
+            yield event.plain_result(
+                "充值请求已提交（实验性功能）\n"
+                "━━━━━━━━━━━━━━\n"
+                f"房间: {room_id}\n"
+                f"当前状态: {status}\n"
+                f"充值金额: {amount_value} 元\n"
+                "━━━━━━━━━━━━━━\n"
+                "⚠️⚠️⚠️重要提示⚠️⚠️⚠️\n "
+                "   支付前请务必仔细核对：\n"
+                "   「收款方信息」「房间号」及「充值金额」。\n"
+                "   因用户个人操作失误导致的\n"
+                "   资金损失，均由用户自行承担，\n"
+                "   开发者对此不承担任何法律责任。\n"
+                f"支付链接:\n{result['pay_url']}\n\n"
+                "请在5分钟内访问链接完成支付\n\n"
+            )
+        else:
+            error_msg = f"[错误] {result['message']}"
+            if result["balance"] is not None:
+                balance = result["balance"]
+                status = f"欠费 {abs(balance):.2f} 元" if balance < 0 else f"余额 {balance:.2f} 元"
+                error_msg += f"\n当前状态: {status}"
+            yield event.plain_result(error_msg)
+
+    @filter.command("确认充值免责", alias={"同意充值免责", "confirm_recharge_disclaimer"})
+    async def confirm_recharge_disclaimer(self, event: AstrMessageEvent):
+        """确认快捷充值免责声明"""
+        umo = event.unified_msg_origin
+
+        if umo not in self.subscribers:
+            yield event.plain_result(
+                "[提示] 您还未绑定房间\n\n"
+                "请先使用 /订阅电费 <房间号> 绑定房间"
+            )
+            return
+
+        if self.subscribers[umo].get("recharge_disclaimer_confirmed", False):
+            yield event.plain_result(
+                "[提示] 您已确认过免责声明（实验性功能）\n\n"
+                "可直接使用 /快捷充值 <金额> 进行充值\n"
+                "单次充值上限: 100 元"
+            )
+            return
+
+        # 检查是否已经阅读过免责声明（防止跳过阅读直接确认）
+        if not self.subscribers[umo].get("recharge_disclaimer_shown", False):
+            yield event.plain_result(
+                "[提示] 请先阅读免责声明\n\n"
+                "请使用 /快捷充值 <金额> 查看免责声明内容\n"
+                "阅读后方可确认"
+            )
+            return
+
+        self.subscribers[umo]["recharge_disclaimer_confirmed"] = True
+        await self.put_kv_data("subscribers", self.subscribers)
+
+        room_id = self.subscribers[umo]["room_id"]
+        yield event.plain_result(
+            "免责声明已确认（实验性功能）\n"
+            "━━━━━━━━━━━━━━\n"
+            f"绑定房间: {room_id}\n\n"
+            "现在可以使用快捷充值功能:\n"
+            "/快捷充值 <金额>\n"
+            "示例: /快捷充值 100\n"
+            "单次充值上限: 100 元\n\n"
+            "⚠️ 每次付款前请务必核对收款方信息、房间号和金额"
         )
 
     @filter.command("我的订阅", alias={"查看订阅", "subscription"})
@@ -1081,7 +1360,7 @@ class CTBUElectPlugin(Star):
                                                     chain = MessageChain().url_image(image_url)
                                                     # 低余额时额外发送缴费链接
                                                     if data.get("remaining", 0) < threshold:
-                                                        chain.message(f"\n━━━━━━━━━━━━━━\n缴费入口:\n{self.pay_url}")
+                                                        chain.message(f"\n━━━━━━━━━━━━━━\n自助缴费系统:\n{self.pay_url}")
                                                     await self.context.send_message(umo, chain)
                                                 else:
                                                     # 渲染失败，降级为纯文本
@@ -1111,7 +1390,7 @@ class CTBUElectPlugin(Star):
                                                 if image_url:
                                                     chain = MessageChain().url_image(image_url)
                                                     # 额外发送缴费链接
-                                                    chain.message(f"\n━━━━━━━━━━━━━━\n缴费入口:\n{self.pay_url}")
+                                                    chain.message(f"\n━━━━━━━━━━━━━━\n自助缴费系统:\n{self.pay_url}")
                                                     await self.context.send_message(umo, chain)
                                                 else:
                                                     # 渲染失败，降级为纯文本
