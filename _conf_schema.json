@@ -4,5 +4,12 @@
     "description": "文转图渲染模式",
     "hint": "启用后使用图片方式展示电费信息（缴费链接会额外以文本形式发送）",
     "default": false
+  },
+  "clear_all_kv_storage": {
+    "type": "bool",
+    "description": "删除所有KV存储内容",
+    "hint": "启用后将清除所有订阅数据和设置（轮询间隔等），此操作不可恢复！执行后自动重置为关闭状态。",
+    "obvious_hint": true,
+    "default": false
   }
 }

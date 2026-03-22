@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import quote, unquote, urlparse
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star
-from astrbot.api import logger
+from astrbot.api import logger, AstrBotConfig
 
 # 东八区时区
 CST = timezone(timedelta(hours=8))
@@ -257,10 +257,13 @@ ELECT_HTML_TEMPLATE = '''
 class CTBUElectPlugin(Star):
     '''CTBU 电费小助手插件'''
 
-    def __init__(self, context: Context, config: dict = None):
-        super().__init__(context, config)
+    def __init__(self, context: Context, config: AstrBotConfig):
+        super().__init__(context)
+        self.config = config
         # 从配置读取文转图渲染模式
         self.render_mode = config.get("render_mode", False) if config else False
+        # 从配置读取清除KV存储标识
+        self.clear_all_kv_storage = config.get("clear_all_kv_storage", False) if config else False
         # 校区前缀映射
         self.CAMPUS_PREFIX = {
             "cy": ("茶园校区", "茶园{building}栋"),      # 茶园10-19栋
@@ -287,6 +290,20 @@ class CTBUElectPlugin(Star):
     async def initialize(self):
         """插件初始化，加载订阅数据并启动定时推送任务"""
         logger.info("CTBU 电费插件初始化中...")
+
+        # 检查是否需要清除所有KV存储内容
+        if self.clear_all_kv_storage:
+            logger.warning("开始清除所有KV存储内容...")
+            await self.delete_kv_data("subscribers")
+            await self.delete_kv_data("poll_interval")
+            logger.warning("所有KV存储内容已清除")
+
+            # 重置配置并保存
+            self.config["clear_all_kv_storage"] = False
+            self.config.save_config()
+            self.clear_all_kv_storage = False
+            logger.info("清除KV存储配置已重置")
+
         logger.info(f"渲染模式: {'文转图' if self.render_mode else '纯文本'}")
         # 从 KV 存储加载订阅数据
         self.subscribers = await self.get_kv_data("subscribers", {})
