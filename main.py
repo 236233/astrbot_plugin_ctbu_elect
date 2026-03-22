@@ -1,5 +1,6 @@
 import aiohttp
 import asyncio
+import os
 import re
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote, unquote, urlparse
@@ -683,12 +684,12 @@ class CTBUElectPlugin(Star):
 
         # 验证房间号格式
         if not self._parse_room_id(room_id):
-            yield event.plain_result(
-                "[错误] 房间号格式错误\n\n" + self._get_help_message()
-            )
+            yield event.plain_result("[错误] 房间号格式错误")
+            help_image_path = os.path.join(os.path.dirname(__file__), "help.png")
+            yield event.image_result(help_image_path)
             return
 
-        yield event.plain_result(f"正在查询 {room_id} ...")
+        # yield event.plain_result(f"正在查询 {room_id} ...")
 
         data = await self._fetch_elect_data(room_id)
         if data:
@@ -724,7 +725,8 @@ class CTBUElectPlugin(Star):
     @filter.command("电费帮助", alias={"dfhelp", "elect_help"})
     async def elect_help(self, event: AstrMessageEvent):
         """显示电费查询帮助"""
-        yield event.plain_result(self._get_help_message())
+        help_image_path = os.path.join(os.path.dirname(__file__), "help.png")
+        yield event.image_result(help_image_path)
 
     @filter.command("订阅电费", alias={"订阅", "subscribe_elect"})
     async def subscribe_elect(self, event: AstrMessageEvent, room_id: str = "", threshold: str = ""):
@@ -752,9 +754,9 @@ class CTBUElectPlugin(Star):
                 return
 
         if not self._parse_room_id(room_id):
-            yield event.plain_result(
-                "[错误] 房间号格式错误\n\n" + self._get_help_message()
-            )
+            yield event.plain_result("[错误] 房间号格式错误")
+            help_image_path = os.path.join(os.path.dirname(__file__), "help.png")
+            yield event.image_result(help_image_path)
             return
 
         # 解析阈值
@@ -1150,20 +1152,11 @@ class CTBUElectPlugin(Star):
                 "====================\n"
                 "本工具仅作为重庆工商大学官方支付链接的技术中转服务，\n"
                 "使用前请务必仔细阅读并同意以下条款：\n\n"
-                "1. 本功能仅提供链接获取便利，\n"
-                "   不担保链接的长期有效性与技术稳定性。\n"
-                "2. 支付前请务必仔细核对\n"
-                "   收款方信息、房间号及充值金额。\n"
-                "3. 因用户个人操作失误导致的\n"
-                "   资金损失，均由用户自行承担，\n"
-                "   开发者对此不承担任何法律责任。\n"
-                "4. 实际支付行为由学校官方收款平台\n"
-                "   独立完成，本工具不接触任何资金。\n"
-                "   请确保使用正规来源插件，警惕第三方\n"
-                "   篡改链接风险，注意资金安全。\n"
-                "5. 使用建议：首次使用或链接更新后，\n"
-                "   建议先以最低金额进行试探性充值，\n"
-                "   确认充值流程与余额查询正常后再进行大额操作。\n\n"
+                "1. 本功能仅提供链接获取便利，不担保链接的长期有效性与技术稳定性。\n"
+                "2. 支付前请务必仔细核对收款方信息、房间号及充值金额。\n"
+                "3. 因用户个人操作失误导致的资金损失，均由用户自行承担，开发者对此不承担任何法律责任。\n"
+                "4. 实际支付行为由学校官方收款平台独立完成，本工具不接触任何资金。请确保使用正规来源插件，警惕第三方篡改链接风险，注意资金安全。\n"
+                "5. 使用建议：首次使用或链接更新后，建议先以最低金额进行试探性充值，确认充值流程与余额查询正常后再进行大额操作。\n\n"
                 "====================\n"
                 f"当前绑定房间：{room_id}\n\n"
                 "如已阅读并同意以上内容，请发送：\n"
@@ -1202,11 +1195,9 @@ class CTBUElectPlugin(Star):
                 "⚠️⚠️⚠️重要提示⚠️⚠️⚠️\n "
                 "   支付前请务必仔细核对：\n"
                 "   「收款方信息」「房间号」及「充值金额」。\n"
-                "   因用户个人操作失误导致的\n"
-                "   资金损失，均由用户自行承担，\n"
-                "   开发者对此不承担任何法律责任。\n"
+                "   因用户个人操作失误导致的资金损失，均由用户自行承担，开发者对此不承担任何法律责任。\n"
                 f"支付链接:\n{result['pay_url']}\n\n"
-                "请在5分钟内访问链接完成支付\n\n"
+                "请在5分钟内访问链接完成支付"
             )
         else:
             error_msg = f"[错误] {result['message']}"
